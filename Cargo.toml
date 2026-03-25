@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/litevec-core",
+    "crates/litevec",
+    "crates/litevec-cli",
+    "crates/litevec-ffi",
+    "crates/litevec-mcp",
+    "crates/litevec-wasm",
+    "bindings/python",
+    "bindings/node",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["LiteVec Contributors"]
+license = "MIT"
+repository = "https://github.com/litevec/litevec"
+homepage = "https://litevec.dev"
+description = "The embedded vector database. No server. No Docker. No config."
+keywords = ["vector", "database", "embedding", "search", "ai"]
+categories = ["database-implementations", "science", "algorithms"]
+
+[workspace.dependencies]
+litevec-core = { path = "crates/litevec-core", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+parking_lot = "0.12"
+memmap2 = "0.9"
+rand = "0.8"
+bytemuck = { version = "1", features = ["derive"] }
+tracing = "0.1"
+ordered-float = "4"
+criterion = { version = "0.5", features = ["html_reports"] }

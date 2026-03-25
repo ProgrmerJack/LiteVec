@@ -1,0 +1,13 @@
+[package]
+name = "litevec-ffi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "C FFI bindings for LiteVec embedded vector database"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+litevec-core = { workspace = true }
+serde_json = { workspace = true }

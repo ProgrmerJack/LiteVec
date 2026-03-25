@@ -1,0 +1,18 @@
+[package]
+name = "litevec-node"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Node.js bindings for LiteVec embedded vector database"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+litevec-core = { path = "../../crates/litevec-core" }
+napi = { version = "2", features = ["napi8", "serde-json"] }
+napi-derive = "2"
+serde_json = "1"
+
+[build-dependencies]
+napi-build = "2"

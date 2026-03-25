@@ -1,0 +1,32 @@
+{
+  "name": "litevec",
+  "version": "0.1.0",
+  "description": "The embedded vector database. No server. No Docker. No config.",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "napi": {
+    "name": "litevec",
+    "triples": {
+      "defaults": true,
+      "additional": [
+        "aarch64-apple-darwin",
+        "aarch64-unknown-linux-gnu",
+        "aarch64-pc-windows-msvc"
+      ]
+    }
+  },
+  "license": "MIT",
+  "keywords": ["vector", "database", "embedding", "search", "ai", "litevec", "hnsw"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ProgrmerJack/LiteVec"
+  },
+  "files": ["index.js", "index.d.ts"],
+  "devDependencies": {
+    "@napi-rs/cli": "^2.18.0"
+  },
+  "scripts": {
+    "build": "napi build --platform --release",
+    "prepublishOnly": "napi prepublish -t npm"
+  }
+}
