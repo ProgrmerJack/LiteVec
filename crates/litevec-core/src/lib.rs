@@ -17,6 +17,7 @@ pub mod types;
 pub use collection::Collection;
 pub use database::Database;
 pub use error::{Error, Result};
+pub use metadata::hybrid::FusionStrategy;
 pub use query::SearchQuery;
 pub use types::{
     BackupCollectionInfo, BackupInfo, CollectionConfig, DatabaseConfig, DistanceType, Filter,

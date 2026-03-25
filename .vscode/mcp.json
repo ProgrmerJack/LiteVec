@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "litevec": {
+      "command": "cargo",
+      "args": ["run", "-p", "litevec-mcp", "--", "--memory"],
+      "env": {}
+    }
+  }
+}

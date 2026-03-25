@@ -11,6 +11,9 @@ use crate::index::flat::FlatIndex;
 use crate::index::hnsw::HnswIndex;
 use crate::index::{VectorIndex, VectorStore};
 use crate::metadata::filter::evaluate_filter;
+use crate::metadata::fulltext::FullTextIndex;
+use crate::metadata::hybrid::{self, FusionStrategy};
+use crate::metadata::secondary::SecondaryIndexManager;
 use crate::metadata::store::MetadataStore;
 use crate::persistence::{CollectionSnapshot, VectorEntry};
 use crate::query::SearchQuery;
@@ -29,12 +32,31 @@ struct CollectionData {
     index: Box<dyn VectorIndex>,
     vector_store: VectorStore,
     metadata_store: MetadataStore,
+    fulltext_index: FullTextIndex,
+    secondary_indexes: SecondaryIndexManager,
     id_map: HashMap<String, u64>,      // string ID → internal ID
     reverse_map: HashMap<u64, String>, // internal ID → string ID
     next_internal_id: u64,
 }
 
 impl CollectionData {
+    /// Concatenate all string values from metadata for FTS indexing.
+    fn extract_text_content(metadata: &serde_json::Value) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(obj) = metadata.as_object() {
+            for value in obj.values() {
+                if let Some(s) = value.as_str() {
+                    parts.push(s.to_string());
+                }
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" "))
+        }
+    }
+
     /// Helper to add a vector to the index with split borrows.
     fn add_to_index(&mut self, internal_id: u64, vector: &[f32]) {
         // Split borrow: get mutable ref to index and immutable refs to the rest
@@ -42,6 +64,12 @@ impl CollectionData {
         let vector_store = &self.vector_store;
         self.index
             .add(internal_id, vector, distance_fn, vector_store);
+    }
+
+    /// Create a secondary index, using split borrows on struct fields.
+    fn create_secondary_index(&mut self, field: &str) {
+        self.secondary_indexes
+            .create_index(field, &self.metadata_store);
     }
 }
 
@@ -63,6 +91,8 @@ impl CollectionInner {
                 index,
                 vector_store: VectorStore::new(),
                 metadata_store: MetadataStore::new(),
+                fulltext_index: FullTextIndex::new(),
+                secondary_indexes: SecondaryIndexManager::new(),
                 id_map: HashMap::new(),
                 reverse_map: HashMap::new(),
                 next_internal_id: 0,
@@ -149,14 +179,25 @@ impl Collection {
 
         // If ID exists, remove old entry first (upsert)
         if let Some(&old_internal) = data.id_map.get(id) {
+            let old_metadata = data.metadata_store.get(old_internal).cloned();
             data.index.remove(old_internal);
             data.vector_store.remove(old_internal);
             data.metadata_store.remove(old_internal);
             data.reverse_map.remove(&old_internal);
+            data.fulltext_index.remove_document(old_internal);
+            if let Some(ref meta) = old_metadata {
+                data.secondary_indexes.on_remove(old_internal, meta);
+            }
         }
 
         let internal_id = data.next_internal_id;
         data.next_internal_id += 1;
+
+        // Index for full-text and secondary indexes before metadata is moved into store
+        if let Some(text) = CollectionData::extract_text_content(&metadata) {
+            data.fulltext_index.add_document(internal_id, &text);
+        }
+        data.secondary_indexes.on_insert(internal_id, &metadata);
 
         data.vector_store.insert(internal_id, vector.to_vec());
         data.metadata_store.insert(internal_id, metadata);
@@ -222,10 +263,18 @@ impl Collection {
             None => return Ok(false),
         };
 
+        let old_metadata = data.metadata_store.get(internal_id).cloned();
+
         data.index.remove(internal_id);
         data.vector_store.remove(internal_id);
         data.metadata_store.remove(internal_id);
         data.reverse_map.remove(&internal_id);
+
+        // Clean up full-text and secondary indexes
+        data.fulltext_index.remove_document(internal_id);
+        if let Some(ref meta) = old_metadata {
+            data.secondary_indexes.on_remove(internal_id, meta);
+        }
 
         Ok(true)
     }
@@ -238,6 +287,19 @@ impl Collection {
             Some(&id) => id,
             None => return Err(Error::VectorNotFound(id.to_string())),
         };
+
+        // Remove old entries from indexes
+        let old_metadata = data.metadata_store.get(internal_id).cloned();
+        data.fulltext_index.remove_document(internal_id);
+        if let Some(ref meta) = old_metadata {
+            data.secondary_indexes.on_remove(internal_id, meta);
+        }
+
+        // Add new entries to indexes before metadata is moved into store
+        if let Some(text) = CollectionData::extract_text_content(&metadata) {
+            data.fulltext_index.add_document(internal_id, &text);
+        }
+        data.secondary_indexes.on_insert(internal_id, &metadata);
 
         data.metadata_store.insert(internal_id, metadata);
         Ok(())
@@ -266,6 +328,107 @@ impl Collection {
     /// Distance type.
     pub fn distance_type(&self) -> DistanceType {
         self.inner.inner.read().config.distance
+    }
+
+    /// Full-text search across metadata string fields.
+    /// Returns results sorted by BM25 relevance score (highest first).
+    pub fn text_search(&self, query: &str, limit: usize) -> Vec<SearchResult> {
+        let data = self.inner.inner.read();
+        let fts_results = data.fulltext_index.search(query, limit);
+
+        fts_results
+            .into_iter()
+            .filter_map(|(internal_id, score)| {
+                let string_id = data.reverse_map.get(&internal_id)?.clone();
+                let metadata = data
+                    .metadata_store
+                    .get(internal_id)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                Some(SearchResult {
+                    id: string_id,
+                    distance: score,
+                    metadata,
+                })
+            })
+            .collect()
+    }
+
+    /// Hybrid search combining vector similarity and keyword matching.
+    /// Uses Reciprocal Rank Fusion (RRF) to merge results.
+    pub fn hybrid_search(
+        &self,
+        vector: &[f32],
+        text_query: &str,
+        k: usize,
+    ) -> Result<Vec<SearchResult>> {
+        self.hybrid_search_with_strategy(vector, text_query, k, FusionStrategy::default())
+    }
+
+    /// Hybrid search with a custom fusion strategy.
+    pub fn hybrid_search_with_strategy(
+        &self,
+        vector: &[f32],
+        text_query: &str,
+        k: usize,
+        strategy: FusionStrategy,
+    ) -> Result<Vec<SearchResult>> {
+        let data = self.inner.inner.read();
+
+        if vector.len() as u32 != data.config.dimension {
+            return Err(Error::DimensionMismatch {
+                expected: data.config.dimension,
+                got: vector.len() as u32,
+            });
+        }
+
+        // Vector search
+        let ef = data.config.hnsw.ef_search;
+        let raw_vector =
+            data.index
+                .search(vector, k, ef, None, data.distance_fn.as_ref(), &data.vector_store);
+
+        // Keyword search
+        let raw_keyword = data.fulltext_index.search(text_query, k);
+
+        // Fuse
+        let fused = hybrid::hybrid_search(&raw_vector, &raw_keyword, strategy, k);
+
+        let results = fused
+            .into_iter()
+            .filter_map(|hr| {
+                let string_id = data.reverse_map.get(&hr.id)?.clone();
+                let metadata = data
+                    .metadata_store
+                    .get(hr.id)
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                Some(SearchResult {
+                    id: string_id,
+                    distance: hr.score,
+                    metadata,
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Create a secondary index on a metadata field for faster filtered search.
+    pub fn create_index(&self, field: &str) {
+        let mut data = self.inner.inner.write();
+        data.create_secondary_index(field);
+    }
+
+    /// Drop a secondary index.
+    pub fn drop_index(&self, field: &str) {
+        let mut data = self.inner.inner.write();
+        data.secondary_indexes.drop_index(field);
+    }
+
+    /// List currently indexed fields.
+    pub fn indexed_fields(&self) -> Vec<String> {
+        self.inner.inner.read().secondary_indexes.indexed_fields()
     }
 
     /// Create a serializable snapshot of this collection.
@@ -321,6 +484,13 @@ impl Collection {
             // Rebuild index from stored vectors
             for entry in &snap.vectors {
                 data.add_to_index(entry.internal_id, &entry.vector);
+            }
+
+            // Rebuild full-text index from stored metadata
+            for entry in &snap.vectors {
+                if let Some(text) = CollectionData::extract_text_content(&entry.metadata) {
+                    data.fulltext_index.add_document(entry.internal_id, &text);
+                }
             }
         }
 
@@ -439,5 +609,103 @@ mod tests {
         assert_eq!(col.dimension(), 384);
         assert_eq!(col.name(), "test");
         assert!(col.is_empty());
+    }
+
+    #[test]
+    fn test_text_search() {
+        let col = make_collection(3);
+        col.insert(
+            "d1",
+            &[1.0, 0.0, 0.0],
+            json!({"title": "rust programming language"}),
+        )
+        .unwrap();
+        col.insert(
+            "d2",
+            &[0.0, 1.0, 0.0],
+            json!({"title": "python scripting"}),
+        )
+        .unwrap();
+        col.insert(
+            "d3",
+            &[0.0, 0.0, 1.0],
+            json!({"title": "rust web framework"}),
+        )
+        .unwrap();
+
+        let results = col.text_search("rust", 10);
+        assert!(results.len() >= 2);
+        let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+        assert!(ids.contains(&"d1"));
+        assert!(ids.contains(&"d3"));
+    }
+
+    #[test]
+    fn test_hybrid_search() {
+        let col = make_collection(3);
+        col.insert(
+            "d1",
+            &[1.0, 0.0, 0.0],
+            json!({"title": "machine learning algorithms"}),
+        )
+        .unwrap();
+        col.insert(
+            "d2",
+            &[0.0, 1.0, 0.0],
+            json!({"title": "deep learning neural networks"}),
+        )
+        .unwrap();
+        col.insert(
+            "d3",
+            &[0.9, 0.1, 0.0],
+            json!({"title": "statistical methods"}),
+        )
+        .unwrap();
+
+        // Hybrid: vector close to d1/d3, text matches "learning" in d1/d2
+        let results = col
+            .hybrid_search(&[0.95, 0.05, 0.0], "learning", 3)
+            .unwrap();
+        assert!(!results.is_empty());
+        // d1 should rank high (matches both vector and text)
+        assert_eq!(results[0].id, "d1");
+    }
+
+    #[test]
+    fn test_secondary_index() {
+        let col = make_collection(2);
+        col.insert("a", &[1.0, 0.0], json!({"category": "tech"}))
+            .unwrap();
+        col.insert("b", &[0.0, 1.0], json!({"category": "science"}))
+            .unwrap();
+        col.insert("c", &[0.5, 0.5], json!({"category": "tech"}))
+            .unwrap();
+
+        col.create_index("category");
+        let fields = col.indexed_fields();
+        assert!(fields.contains(&"category".to_string()));
+
+        // Verify the index doesn't break search
+        let results = col
+            .search(&[1.0, 0.0], 10)
+            .filter(Filter::Eq("category".into(), json!("tech")))
+            .execute()
+            .unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[test]
+    fn test_text_search_after_delete() {
+        let col = make_collection(2);
+        col.insert("a", &[1.0, 0.0], json!({"title": "hello world"}))
+            .unwrap();
+        col.insert("b", &[0.0, 1.0], json!({"title": "hello universe"}))
+            .unwrap();
+
+        col.delete("a").unwrap();
+
+        let results = col.text_search("hello", 10);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "b");
     }
 }

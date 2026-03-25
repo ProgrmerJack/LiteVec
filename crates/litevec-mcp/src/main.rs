@@ -5,25 +5,38 @@ use litevec_core::{Database, Filter};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
-#[command(name = "litevec-mcp", about = "MCP server for LiteVec")]
+#[command(name = "litevec-mcp", about = "LiteVec MCP server — vector database tools for AI agents")]
 struct Cli {
-    /// Path to the LiteVec database file
+    /// Path to the LiteVec database file (persistent storage)
+    #[arg(long, alias = "db")]
+    database: Option<String>,
+
+    /// Use an in-memory database (data lost when server stops)
     #[arg(long)]
-    database: String,
+    memory: bool,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let db = match Database::open(&cli.database) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("Failed to open database at {}: {e}", cli.database);
+    let db = if cli.memory {
+        Database::open_memory().expect("Failed to create in-memory database")
+    } else if let Some(ref path) = cli.database {
+        Database::open(path).unwrap_or_else(|e| {
+            eprintln!("Failed to open database at {}: {e}", path);
             std::process::exit(1);
-        }
+        })
+    } else {
+        eprintln!("Error: specify --database <path> or --memory");
+        std::process::exit(1);
     };
 
-    eprintln!("litevec-mcp: database opened at {}", cli.database);
+    let label = if cli.memory {
+        "in-memory".to_string()
+    } else {
+        cli.database.clone().unwrap_or_default()
+    };
+    eprintln!("litevec-mcp: database opened ({label})");
 
     let stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -96,75 +109,150 @@ fn handle_tools_list(id: &Option<Value>) -> Value {
     let tools = vec![
         tool_def(
             "litevec_create_collection",
-            "Create a new vector collection",
+            "Create a new vector collection in the database. Collections store vectors of a fixed dimension with optional JSON metadata. Use this before inserting any vectors.",
             json!({
                 "type": "object",
                 "properties": {
-                    "collection": { "type": "string", "description": "Collection name" },
-                    "dimension": { "type": "integer", "description": "Vector dimension" }
+                    "name": { "type": "string", "description": "Name for the new collection (must be unique)" },
+                    "dimension": { "type": "integer", "description": "Vector dimension (must match your embedding model, e.g., 384 for all-MiniLM-L6-v2, 1536 for OpenAI text-embedding-3-small)" }
                 },
-                "required": ["collection", "dimension"]
+                "required": ["name", "dimension"]
+            }),
+        ),
+        tool_def(
+            "litevec_list_collections",
+            "List all vector collections in the database with their names, dimensions, and vector counts.",
+            json!({
+                "type": "object",
+                "properties": {},
+                "required": []
             }),
         ),
         tool_def(
             "litevec_insert",
-            "Insert a vector into a collection",
+            "Insert a vector into a collection with a unique string ID and optional JSON metadata. If a vector with this ID already exists, it will be updated (upsert behavior).",
             json!({
                 "type": "object",
                 "properties": {
                     "collection": { "type": "string", "description": "Collection name" },
-                    "id": { "type": "string", "description": "Vector ID" },
-                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Vector values" },
-                    "metadata": { "type": "object", "description": "Optional metadata" }
+                    "id": { "type": "string", "description": "Unique identifier for this vector" },
+                    "vector": { "type": "array", "items": { "type": "number" }, "description": "The embedding vector (must match collection dimension)" },
+                    "metadata": { "type": "object", "description": "Optional JSON metadata to store with the vector (e.g., {\"text\": \"...\", \"source\": \"...\"})" }
                 },
                 "required": ["collection", "id", "vector"]
             }),
         ),
         tool_def(
-            "litevec_search",
-            "Search for similar vectors",
+            "litevec_batch_insert",
+            "Insert multiple vectors at once. More efficient than individual inserts for bulk operations. Each item needs an id, vector, and optional metadata.",
             json!({
                 "type": "object",
                 "properties": {
                     "collection": { "type": "string", "description": "Collection name" },
-                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Query vector" },
-                    "k": { "type": "integer", "description": "Number of results (default 10)" },
-                    "filter": { "type": "object", "description": "Optional metadata filter" }
+                    "items": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": { "type": "string" },
+                                "vector": { "type": "array", "items": { "type": "number" } },
+                                "metadata": { "type": "object" }
+                            },
+                            "required": ["id", "vector"]
+                        },
+                        "description": "Array of vectors to insert"
+                    }
+                },
+                "required": ["collection", "items"]
+            }),
+        ),
+        tool_def(
+            "litevec_search",
+            "Find the k most similar vectors to a query vector using approximate nearest neighbor search (HNSW algorithm). Optionally filter results by metadata fields. Returns results sorted by distance (lowest = most similar).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "collection": { "type": "string", "description": "Collection name" },
+                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Query vector to find similar vectors to" },
+                    "k": { "type": "integer", "description": "Number of results to return (default: 10)", "default": 10 },
+                    "filter": { "type": "object", "description": "Optional metadata filter. Simple: {\"field\": \"value\"} for equality. Advanced: {\"field\": {\"$gt\": 5}} for comparison ($gt, $gte, $lt, $lte, $ne, $in, $eq). Combine: {\"$and\": [...]} or {\"$or\": [...]}" }
                 },
                 "required": ["collection", "vector"]
             }),
         ),
         tool_def(
-            "litevec_get",
-            "Get a vector by ID",
+            "litevec_text_search",
+            "Full-text keyword search across metadata string fields using BM25 ranking. Use this when you want to find documents by keywords rather than semantic similarity.",
             json!({
                 "type": "object",
                 "properties": {
                     "collection": { "type": "string", "description": "Collection name" },
-                    "id": { "type": "string", "description": "Vector ID" }
+                    "query": { "type": "string", "description": "Text query to search for (keywords)" },
+                    "limit": { "type": "integer", "description": "Maximum number of results (default: 10)", "default": 10 }
+                },
+                "required": ["collection", "query"]
+            }),
+        ),
+        tool_def(
+            "litevec_hybrid_search",
+            "Combined vector similarity + keyword search using Reciprocal Rank Fusion (RRF). Best of both worlds: finds documents that are semantically similar AND contain relevant keywords. Use this for the most comprehensive search.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "collection": { "type": "string", "description": "Collection name" },
+                    "vector": { "type": "array", "items": { "type": "number" }, "description": "Query embedding vector" },
+                    "query": { "type": "string", "description": "Text query for keyword matching" },
+                    "k": { "type": "integer", "description": "Number of results to return (default: 10)", "default": 10 }
+                },
+                "required": ["collection", "vector", "query"]
+            }),
+        ),
+        tool_def(
+            "litevec_get",
+            "Retrieve a specific vector and its metadata by ID. Returns the full vector data, metadata, and ID.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "collection": { "type": "string", "description": "Collection name" },
+                    "id": { "type": "string", "description": "Vector ID to retrieve" }
                 },
                 "required": ["collection", "id"]
             }),
         ),
         tool_def(
             "litevec_delete",
-            "Delete a vector by ID",
+            "Delete a vector from a collection by ID. Returns whether the vector existed and was deleted.",
             json!({
                 "type": "object",
                 "properties": {
                     "collection": { "type": "string", "description": "Collection name" },
-                    "id": { "type": "string", "description": "Vector ID" }
+                    "id": { "type": "string", "description": "Vector ID to delete" }
                 },
                 "required": ["collection", "id"]
             }),
         ),
         tool_def(
-            "litevec_info",
-            "Get database info (list collections and sizes)",
+            "litevec_update_metadata",
+            "Update the metadata of an existing vector without changing the vector itself. Replaces the entire metadata object.",
             json!({
                 "type": "object",
-                "properties": {},
-                "required": []
+                "properties": {
+                    "collection": { "type": "string", "description": "Collection name" },
+                    "id": { "type": "string", "description": "Vector ID to update" },
+                    "metadata": { "type": "object", "description": "New metadata to replace the existing metadata" }
+                },
+                "required": ["collection", "id", "metadata"]
+            }),
+        ),
+        tool_def(
+            "litevec_collection_info",
+            "Get detailed info about a specific collection including its name, vector dimension, vector count, and distance metric.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Collection name to get info about" }
+                },
+                "required": ["name"]
             }),
         ),
     ];
@@ -182,11 +270,16 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, db: &Database) -> Value
 
     let result = match tool_name {
         "litevec_create_collection" => tool_create_collection(&args, db),
+        "litevec_list_collections" | "litevec_info" => tool_list_collections(db),
         "litevec_insert" => tool_insert(&args, db),
+        "litevec_batch_insert" => tool_batch_insert(&args, db),
         "litevec_search" => tool_search(&args, db),
+        "litevec_text_search" => tool_text_search(&args, db),
+        "litevec_hybrid_search" => tool_hybrid_search(&args, db),
         "litevec_get" => tool_get(&args, db),
         "litevec_delete" => tool_delete(&args, db),
-        "litevec_info" => tool_info(db),
+        "litevec_update_metadata" => tool_update_metadata(&args, db),
+        "litevec_collection_info" => tool_collection_info(&args, db),
         _ => Err(format!("Unknown tool: {tool_name}")),
     };
 
@@ -214,7 +307,7 @@ fn handle_tools_call(id: &Option<Value>, params: &Value, db: &Database) -> Value
 // ---------------------------------------------------------------------------
 
 fn tool_create_collection(args: &Value, db: &Database) -> Result<String, String> {
-    let name = arg_str(args, "collection")?;
+    let name = arg_str(args, "name")?;
     let dim = arg_u32(args, "dimension")?;
     db.create_collection(&name, dim)
         .map_err(|e| e.to_string())?;
@@ -312,7 +405,111 @@ fn tool_delete(args: &Value, db: &Database) -> Result<String, String> {
     }
 }
 
-fn tool_info(db: &Database) -> Result<String, String> {
+fn tool_batch_insert(args: &Value, db: &Database) -> Result<String, String> {
+    let coll_name = arg_str(args, "collection")?;
+    let items = args
+        .get("items")
+        .and_then(|v| v.as_array())
+        .ok_or("Missing 'items' array")?;
+    let coll = db
+        .get_collection(&coll_name)
+        .ok_or_else(|| format!("Collection '{coll_name}' not found"))?;
+
+    let mut batch: Vec<(String, Vec<f32>, Value)> = Vec::with_capacity(items.len());
+    for item in items {
+        let id = item
+            .get("id")
+            .and_then(|v| v.as_str())
+            .ok_or("Each item must have an 'id' string")?
+            .to_string();
+        let vector: Vec<f32> = item
+            .get("vector")
+            .and_then(|v| v.as_array())
+            .ok_or("Each item must have a 'vector' array")?
+            .iter()
+            .filter_map(|v| v.as_f64().map(|f| f as f32))
+            .collect();
+        let metadata = item.get("metadata").cloned().unwrap_or(json!({}));
+        batch.push((id, vector, metadata));
+    }
+
+    let refs: Vec<(&str, &[f32], Value)> = batch
+        .iter()
+        .map(|(id, vec, meta)| (id.as_str(), vec.as_slice(), meta.clone()))
+        .collect();
+    coll.insert_batch(&refs).map_err(|e| e.to_string())?;
+
+    let count = refs.len();
+    Ok(format!(
+        "Inserted {count} vectors into collection '{coll_name}'"
+    ))
+}
+
+fn tool_text_search(args: &Value, db: &Database) -> Result<String, String> {
+    let coll_name = arg_str(args, "collection")?;
+    let query = arg_str(args, "query")?;
+    let limit = args
+        .get("limit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10) as usize;
+    let coll = db
+        .get_collection(&coll_name)
+        .ok_or_else(|| format!("Collection '{coll_name}' not found"))?;
+
+    let results = coll.text_search(&query, limit);
+    let items: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "score": r.distance,
+                "metadata": r.metadata,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string(&items).unwrap())
+}
+
+fn tool_hybrid_search(args: &Value, db: &Database) -> Result<String, String> {
+    let coll_name = arg_str(args, "collection")?;
+    let vector = arg_f32_vec(args, "vector")?;
+    let query = arg_str(args, "query")?;
+    let k = args.get("k").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let coll = db
+        .get_collection(&coll_name)
+        .ok_or_else(|| format!("Collection '{coll_name}' not found"))?;
+
+    let results = coll
+        .hybrid_search(&vector, &query, k)
+        .map_err(|e| e.to_string())?;
+    let items: Vec<Value> = results
+        .iter()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "score": r.distance,
+                "metadata": r.metadata,
+            })
+        })
+        .collect();
+    Ok(serde_json::to_string(&items).unwrap())
+}
+
+fn tool_update_metadata(args: &Value, db: &Database) -> Result<String, String> {
+    let coll_name = arg_str(args, "collection")?;
+    let id = arg_str(args, "id")?;
+    let metadata = args.get("metadata").cloned().ok_or("Missing 'metadata'")?;
+    let coll = db
+        .get_collection(&coll_name)
+        .ok_or_else(|| format!("Collection '{coll_name}' not found"))?;
+    coll.update_metadata(&id, metadata)
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "Updated metadata for vector '{id}' in '{coll_name}'"
+    ))
+}
+
+fn tool_list_collections(db: &Database) -> Result<String, String> {
     let names = db.list_collections();
     let mut collections = Vec::new();
     for name in &names {
@@ -320,11 +517,27 @@ fn tool_info(db: &Database) -> Result<String, String> {
             collections.push(json!({
                 "name": name,
                 "dimension": coll.dimension(),
-                "size": coll.len(),
+                "count": coll.len(),
+                "distance": format!("{:?}", coll.distance_type()),
             }));
         }
     }
     Ok(serde_json::to_string(&json!({ "collections": collections })).unwrap())
+}
+
+fn tool_collection_info(args: &Value, db: &Database) -> Result<String, String> {
+    let name = arg_str(args, "name")?;
+    let coll = db
+        .get_collection(&name)
+        .ok_or_else(|| format!("Collection '{name}' not found"))?;
+    Ok(serde_json::to_string(&json!({
+        "name": coll.name(),
+        "dimension": coll.dimension(),
+        "count": coll.len(),
+        "distance": format!("{:?}", coll.distance_type()),
+        "is_empty": coll.is_empty(),
+    }))
+    .unwrap())
 }
 
 // ---------------------------------------------------------------------------

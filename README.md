@@ -396,7 +396,22 @@ litevec-mcp --memory
 }
 ```
 
-**Available tools:** `create_collection`, `insert`, `search`, `get`, `delete`, `info`
+**Available tools (11):** `create_collection`, `list_collections`, `insert`, `batch_insert`, `search`, `text_search`, `hybrid_search`, `get`, `delete`, `update_metadata`, `collection_info`
+
+### VS Code / GitHub Copilot
+
+Add `.vscode/mcp.json` to your project:
+
+```json
+{
+  "servers": {
+    "litevec": {
+      "command": "cargo",
+      "args": ["run", "-p", "litevec-mcp", "--", "--memory"]
+    }
+  }
+}
+```
 
 See [docs/api/mcp.md](docs/api/mcp.md) for full protocol documentation.
 
