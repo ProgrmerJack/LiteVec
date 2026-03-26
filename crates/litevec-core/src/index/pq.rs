@@ -289,7 +289,7 @@ impl ProductQuantizer {
         }
 
         let mut results: Vec<(u64, f32)> = heap.into_iter().map(|(d, id)| (id, d.0)).collect();
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        results.sort_by(|a, b| a.1.total_cmp(&b.1));
         results
     }
 

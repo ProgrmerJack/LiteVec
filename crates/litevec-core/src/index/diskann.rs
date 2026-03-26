@@ -108,7 +108,7 @@ impl VamanaIndex {
         }
 
         let mut out: Vec<(u64, f32)> = results.into_iter().map(|(d, id)| (id, d.0)).collect();
-        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        out.sort_by(|a, b| a.1.total_cmp(&b.1));
         out
     }
 
@@ -129,7 +129,7 @@ impl VamanaIndex {
     ) -> Vec<u64> {
         // Sort candidates by distance to p (ascending)
         let mut sorted: Vec<(u64, f32)> = candidates.to_vec();
-        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        sorted.sort_by(|a, b| a.1.total_cmp(&b.1));
 
         let mut selected: Vec<u64> = Vec::with_capacity(max_degree);
 

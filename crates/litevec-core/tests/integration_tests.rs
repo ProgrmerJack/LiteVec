@@ -23,7 +23,6 @@ fn random_vector(dim: usize, seed: u64) -> Vec<f32> {
         .collect()
 }
 
-#[allow(dead_code)]
 fn normalize(v: &mut [f32]) {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -31,6 +30,12 @@ fn normalize(v: &mut [f32]) {
             *x /= norm;
         }
     }
+}
+
+fn normalized_random_vector(dim: usize, seed: u64) -> Vec<f32> {
+    let mut v = random_vector(dim, seed);
+    normalize(&mut v);
+    v
 }
 
 // ──────────────────────────── Full Lifecycle ─────────────────────────────
@@ -567,4 +572,491 @@ fn test_large_collection() {
     let results = col.search(&random_vector(32, 500), 10).execute().unwrap();
     assert_eq!(results.len(), 10);
     assert_eq!(results[0].id, "v500");
+}
+
+// ───────────────────── Crash Recovery (Snapshot) ─────────────────────
+
+#[test]
+fn test_crash_recovery_via_drop() {
+    let path = std::env::temp_dir().join(format!("litevec_crash_{}.lv", std::process::id()));
+    let snap_path = path.with_extension("lv.snap");
+    let wal_path = path.with_extension("lv-wal");
+
+    // Cleanup any leftovers
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&snap_path);
+    let _ = std::fs::remove_file(&wal_path);
+
+    // Phase 1: Open DB, insert data, drop without explicit close (simulates crash)
+    {
+        let db = Database::open(&path).unwrap();
+        let col = db.create_collection("docs", 8).unwrap();
+        for i in 0u64..20 {
+            col.insert(
+                &format!("d{i}"),
+                &random_vector(8, i),
+                json!({"idx": i, "tag": format!("item-{i}")}),
+            )
+            .unwrap();
+        }
+        assert_eq!(col.len(), 20);
+        // Intentional: no db.close() — Drop impl should checkpoint
+    }
+
+    // The snapshot should have been written by Drop
+    assert!(snap_path.exists(), "snapshot must exist after implicit drop");
+
+    // Phase 2: Reopen — all data should be recovered from the snapshot
+    {
+        let db = Database::open(&path).unwrap();
+        let names = db.list_collections();
+        assert_eq!(names, vec!["docs"]);
+
+        let col = db.get_collection("docs").unwrap();
+        assert_eq!(col.len(), 20);
+        assert_eq!(col.dimension(), 8);
+
+        // Verify individual records survived
+        for i in 0u64..20 {
+            let rec = col.get(&format!("d{i}")).unwrap();
+            assert!(rec.is_some(), "record d{i} must be recovered");
+            let rec = rec.unwrap();
+            assert_eq!(rec.metadata["idx"], i);
+        }
+
+        // Verify search still works after recovery
+        let query = random_vector(8, 0);
+        let results = col.search(&query, 5).execute().unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].id, "d0");
+
+        db.close().unwrap();
+    }
+
+    // Cleanup
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&snap_path);
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+/// Verify data survives multiple open/drop cycles without explicit close.
+#[test]
+fn test_repeated_crash_recovery() {
+    let path = std::env::temp_dir().join(format!("litevec_multi_crash_{}.lv", std::process::id()));
+    let snap_path = path.with_extension("lv.snap");
+    let wal_path = path.with_extension("lv-wal");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&snap_path);
+    let _ = std::fs::remove_file(&wal_path);
+
+    // Round 1: create + insert
+    {
+        let db = Database::open(&path).unwrap();
+        let col = db.create_collection("data", 4).unwrap();
+        col.insert("a", &[1.0, 0.0, 0.0, 0.0], json!({"round": 1}))
+            .unwrap();
+        // drop without close
+    }
+
+    // Round 2: reopen, verify, add more, drop again
+    {
+        let db = Database::open(&path).unwrap();
+        let col = db.get_collection("data").unwrap();
+        assert_eq!(col.len(), 1);
+        col.insert("b", &[0.0, 1.0, 0.0, 0.0], json!({"round": 2}))
+            .unwrap();
+        assert_eq!(col.len(), 2);
+        // drop without close
+    }
+
+    // Round 3: reopen, verify both records survived both crashes
+    {
+        let db = Database::open(&path).unwrap();
+        let col = db.get_collection("data").unwrap();
+        assert_eq!(col.len(), 2);
+        let a = col.get("a").unwrap().unwrap();
+        assert_eq!(a.metadata["round"], 1);
+        let b = col.get("b").unwrap().unwrap();
+        assert_eq!(b.metadata["round"], 2);
+        db.close().unwrap();
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&snap_path);
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+// ──────────────────── Large Dataset + Recall ──────────────────────
+
+/// Insert 10,000 vectors, measure HNSW recall@10 against brute-force ground truth.
+#[test]
+fn test_large_dataset_recall() {
+    let n = 10_000u64;
+    let dim = 32;
+    let k = 10;
+    let num_queries = 50;
+    let db = make_memory_db();
+
+    let flat_config = CollectionConfig {
+        dimension: dim as u32,
+        index: IndexType::Flat,
+        ..CollectionConfig::new(dim as u32)
+    };
+    let hnsw_config = CollectionConfig {
+        dimension: dim as u32,
+        index: IndexType::Hnsw,
+        ..CollectionConfig::new(dim as u32)
+    };
+
+    let flat_col = db
+        .create_collection_with_config("flat_large", flat_config)
+        .unwrap();
+    let hnsw_col = db
+        .create_collection_with_config("hnsw_large", hnsw_config)
+        .unwrap();
+
+    // Insert same data into both
+    for i in 0..n {
+        let v = normalized_random_vector(dim, i);
+        flat_col.insert(&format!("v{i}"), &v, json!({})).unwrap();
+        hnsw_col.insert(&format!("v{i}"), &v, json!({})).unwrap();
+    }
+
+    assert_eq!(flat_col.len(), n as usize);
+    assert_eq!(hnsw_col.len(), n as usize);
+
+    // Measure recall
+    let mut total_recall = 0.0;
+    for q in 0..num_queries {
+        let query = normalized_random_vector(dim, 100_000 + q);
+
+        let truth: Vec<String> = flat_col
+            .search(&query, k)
+            .execute()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        let approx: Vec<String> = hnsw_col
+            .search(&query, k)
+            .execute()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+
+        let hits = approx.iter().filter(|id| truth.contains(id)).count();
+        total_recall += hits as f64 / k as f64;
+    }
+
+    let avg_recall = total_recall / num_queries as f64;
+    assert!(
+        avg_recall >= 0.90,
+        "HNSW recall@{k} on {n} vectors = {avg_recall:.3}, expected >= 0.90"
+    );
+}
+
+// ───────────── Concurrent File-Backed Access ─────────────────────
+
+#[test]
+fn test_concurrent_file_backed() {
+    let path =
+        std::env::temp_dir().join(format!("litevec_concurrent_{}.lv", std::process::id()));
+    let snap_path = path.with_extension("lv.snap");
+    let wal_path = path.with_extension("lv-wal");
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&snap_path);
+    let _ = std::fs::remove_file(&wal_path);
+
+    let db = Database::open(&path).unwrap();
+    let col = db.create_collection("shared", 16).unwrap();
+
+    // Seed with initial data
+    for i in 0..100 {
+        col.insert(&format!("init_{i}"), &random_vector(16, i), json!({}))
+            .unwrap();
+    }
+
+    let mut handles = vec![];
+
+    // 2 writer threads
+    for t in 0..2 {
+        let col = col.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..50 {
+                let id = format!("w{t}_{i}");
+                col.insert(&id, &random_vector(16, (t * 1000 + i) as u64), json!({}))
+                    .unwrap();
+            }
+        }));
+    }
+
+    // 4 reader threads
+    for _ in 0..4 {
+        let col = col.clone();
+        handles.push(std::thread::spawn(move || {
+            for i in 0..50 {
+                let q = random_vector(16, i + 5000);
+                let results = col.search(&q, 5).execute().unwrap();
+                assert!(!results.is_empty() || col.is_empty());
+            }
+        }));
+    }
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    // 100 initial + 2*50 written = 200
+    assert_eq!(col.len(), 200);
+
+    // Close and reopen to verify persistence
+    db.close().unwrap();
+
+    let db2 = Database::open(&path).unwrap();
+    let col2 = db2.get_collection("shared").unwrap();
+    assert_eq!(col2.len(), 200);
+    db2.close().unwrap();
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&snap_path);
+    let _ = std::fs::remove_file(&wal_path);
+}
+
+// ─────────────────── All Filter Operators ─────────────────────────
+
+#[test]
+fn test_all_filter_operators() {
+    let db = make_memory_db();
+    let col = db.create_collection("filters", 4).unwrap();
+
+    // Insert 30 items with diverse metadata
+    for i in 0u64..30 {
+        col.insert(
+            &format!("item_{i}"),
+            &random_vector(4, i),
+            json!({
+                "score": i as f64,
+                "tier": match i % 3 { 0 => "gold", 1 => "silver", _ => "bronze" },
+                "active": i % 2 == 0,
+            }),
+        )
+        .unwrap();
+    }
+
+    let q = random_vector(4, 999);
+
+    // Eq
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Eq("tier".into(), json!("gold")))
+        .execute()
+        .unwrap();
+    assert!(results.iter().all(|r| {
+        col.get(&r.id).unwrap().unwrap().metadata["tier"] == "gold"
+    }));
+    assert_eq!(results.len(), 10); // 0,3,6,...,27
+
+    // Ne
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Ne("tier".into(), json!("gold")))
+        .execute()
+        .unwrap();
+    assert!(results.iter().all(|r| {
+        col.get(&r.id).unwrap().unwrap().metadata["tier"] != "gold"
+    }));
+    assert_eq!(results.len(), 20);
+
+    // Gt
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Gt("score".into(), 25.0))
+        .execute()
+        .unwrap();
+    assert!(results.iter().all(|r| {
+        col.get(&r.id).unwrap().unwrap().metadata["score"]
+            .as_f64()
+            .unwrap()
+            > 25.0
+    }));
+
+    // Lt
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Lt("score".into(), 5.0))
+        .execute()
+        .unwrap();
+    assert!(results.iter().all(|r| {
+        col.get(&r.id).unwrap().unwrap().metadata["score"]
+            .as_f64()
+            .unwrap()
+            < 5.0
+    }));
+
+    // Gte
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Gte("score".into(), 28.0))
+        .execute()
+        .unwrap();
+    assert_eq!(results.len(), 2); // 28, 29
+
+    // Lte
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Lte("score".into(), 1.0))
+        .execute()
+        .unwrap();
+    assert_eq!(results.len(), 2); // 0, 1
+
+    // In
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::In(
+            "tier".into(),
+            vec![json!("gold"), json!("silver")],
+        ))
+        .execute()
+        .unwrap();
+    assert_eq!(results.len(), 20); // gold(10) + silver(10)
+
+    // Or
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Or(vec![
+            Filter::Eq("tier".into(), json!("bronze")),
+            Filter::Gt("score".into(), 27.0),
+        ]))
+        .execute()
+        .unwrap();
+    assert!(!results.is_empty());
+
+    // Not
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::Not(Box::new(Filter::Eq(
+            "active".into(),
+            json!(true),
+        ))))
+        .execute()
+        .unwrap();
+    assert!(results.iter().all(|r| {
+        col.get(&r.id).unwrap().unwrap().metadata["active"] == false
+    }));
+
+    // And (compound)
+    let results = col
+        .search(&q, 30)
+        .filter(Filter::And(vec![
+            Filter::Eq("tier".into(), json!("gold")),
+            Filter::Gte("score".into(), 15.0),
+        ]))
+        .execute()
+        .unwrap();
+    assert!(results.iter().all(|r| {
+        let m = &col.get(&r.id).unwrap().unwrap().metadata;
+        m["tier"] == "gold" && m["score"].as_f64().unwrap() >= 15.0
+    }));
+}
+
+// ──────────────────── Full-Text + Hybrid Search ──────────────────────
+
+#[test]
+fn test_fulltext_and_hybrid_search_integration() {
+    let db = make_memory_db();
+    let col = db.create_collection("articles", 4).unwrap();
+
+    let docs = [
+        ("d1", "Rust programming language systems", [1.0, 0.0, 0.0, 0.0]),
+        ("d2", "Python machine learning data science", [0.0, 1.0, 0.0, 0.0]),
+        ("d3", "Rust web framework actix tower", [0.9, 0.1, 0.0, 0.0]),
+        ("d4", "JavaScript React frontend development", [0.0, 0.0, 1.0, 0.0]),
+        ("d5", "Rust embedded systems microcontroller", [0.8, 0.0, 0.2, 0.0]),
+    ];
+
+    for (id, text, vec) in &docs {
+        col.insert(id, vec, json!({"text": text})).unwrap();
+    }
+
+    // Pure text search — should find Rust-related docs
+    let results = col.text_search("Rust programming", 5);
+    assert!(!results.is_empty());
+    // The top result should mention Rust
+    let top = col.get(&results[0].id).unwrap().unwrap();
+    let text = top.metadata["text"].as_str().unwrap();
+    assert!(text.contains("Rust"), "top text search result should contain 'Rust'");
+
+    // Hybrid search — combines vector similarity with keyword relevance
+    let results = col.hybrid_search(&[0.95, 0.05, 0.0, 0.0], "Rust systems", 3).unwrap();
+    assert!(!results.is_empty());
+    // d1 or d5 should rank high (both Rust + systems related)
+    let top_ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+    assert!(
+        top_ids.contains(&"d1") || top_ids.contains(&"d5"),
+        "hybrid search should surface Rust systems docs, got: {top_ids:?}"
+    );
+}
+
+// ──────────────────── Backup & Restore ──────────────────────
+
+#[test]
+fn test_backup_and_restore() {
+    let src_path =
+        std::env::temp_dir().join(format!("litevec_backup_src_{}.lv", std::process::id()));
+    let backup_path =
+        std::env::temp_dir().join(format!("litevec_backup_dst_{}.lv", std::process::id()));
+
+    // Clean up
+    for p in [&src_path, &backup_path] {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(p.with_extension("lv.snap"));
+        let _ = std::fs::remove_file(p.with_extension("lv-wal"));
+    }
+
+    // Create source DB with data
+    {
+        let db = Database::open(&src_path).unwrap();
+        let col = db.create_collection("important", 8).unwrap();
+        for i in 0..50 {
+            col.insert(
+                &format!("rec_{i}"),
+                &random_vector(8, i),
+                json!({"value": i}),
+            )
+            .unwrap();
+        }
+        db.create_backup(&backup_path).unwrap();
+        db.close().unwrap();
+    }
+
+    // Restore from backup into a new DB
+    {
+        let db = Database::restore_from_backup(&backup_path).unwrap();
+        let col = db.get_collection("important").unwrap();
+        assert_eq!(col.len(), 50);
+
+        // Verify data integrity
+        let rec = col.get("rec_0").unwrap().unwrap();
+        assert_eq!(rec.metadata["value"], 0);
+
+        // Verify search works on restored data
+        let results = col.search(&random_vector(8, 25), 5).execute().unwrap();
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].id, "rec_25");
+    }
+
+    // Check backup_info
+    let info = Database::backup_info(&backup_path);
+    assert!(info.is_ok());
+
+    // Clean up
+    for p in [&src_path, &backup_path] {
+        let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_file(p.with_extension("lv.snap"));
+        let _ = std::fs::remove_file(p.with_extension("lv-wal"));
+    }
 }

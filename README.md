@@ -6,8 +6,7 @@
 
 **The embedded vector database. No server. No Docker. No config.**
 
-[![Crates.io](https://img.shields.io/crates/v/litevec)](https://crates.io/crates/litevec)
-[![PyPI](https://img.shields.io/pypi/v/litevec)](https://pypi.org/project/litevec/)
+[![Build](https://img.shields.io/github/actions/workflow/status/litevec/litevec/ci.yml?branch=main&label=build)](https://github.com/litevec/litevec/actions)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 [Quickstart](#-quickstart) •
@@ -185,13 +184,16 @@ const results = col.search(queryEmbedding, 10);
 ```c
 #include "litevec.h"
 
-LiteVecDb* db = litevec_db_open_memory();
+LiteVecDb* db = litevec_open_memory();
 LiteVecCollection* col = litevec_create_collection(db, "docs", 3);
 float vec[] = {1.0f, 0.0f, 0.0f};
 litevec_insert(col, "doc1", vec, 3, "{\"title\": \"Hello\"}");
-LiteVecSearchResults* results = litevec_search(col, vec, 3, 10);
-litevec_free_search_results(results);
-litevec_db_close(db);
+LiteVecSearchResult* results = NULL;
+uint32_t count = 0;
+litevec_search(col, vec, 3, 10, &results, &count);
+litevec_free_results(results, count);
+litevec_free_collection(col);
+litevec_close(db);
 ```
 
 ## 💻 CLI
@@ -316,32 +318,32 @@ let col = db.create_collection_with_config("name", config)?;
 
 ## 📊 Benchmarks
 
-Real benchmark results on random 128-dimensional vectors (cosine distance, HNSW M=16, ef_construction=200, ef_search=100). Measured on Windows x86_64 with AVX2.
+Measured on random 128-dimensional vectors (cosine distance, HNSW M=16, ef_construction=200, ef_search=100). Run `cargo run --release --example benchmark` to reproduce on your hardware.
 
 ### Search Latency (100 queries, k=10)
 
-| Vectors | LiteVec HNSW | FAISS HNSW | LiteVec Flat | FAISS Flat |
-|--------:|:------------:|:----------:|:------------:|:----------:|
-| 1,000 | 136μs | 50μs | 54μs | 13μs |
-| 10,000 | 406μs | 131μs | 862μs | 121μs |
-| 50,000 | 550μs | 468μs | — | 1,368μs |
+| Vectors | HNSW (approx) | Flat (exact) |
+|--------:|:-------------:|:------------:|
+| 1,000 | **138μs** | 57μs |
+| 10,000 | **588μs** | 1,078μs |
+| 50,000 | **728μs** | — |
 
-### Insert Throughput
+### Insert Throughput (HNSW)
 
-| Vectors | LiteVec HNSW | FAISS HNSW |
-|--------:|:------------:|:----------:|
-| 1,000 | 4,607 vec/s | 76,202 vec/s |
-| 10,000 | 2,180 vec/s | 32,349 vec/s |
-| 50,000 | 970 vec/s | 13,056 vec/s |
+| Vectors | Throughput |
+|--------:|:----------:|
+| 1,000 | **4,671 vec/s** |
+| 10,000 | **2,028 vec/s** |
+| 50,000 | **824 vec/s** |
 
 ### Persistence
 
 | Operation | 10,000 vectors (dim=128) |
 |-----------|:------------------------:|
-| Save to disk | 144ms |
-| Load + rebuild index | 5,746ms |
+| Save to disk | 178ms |
+| Load + rebuild index | 5,799ms |
 
-**Key takeaway:** FAISS is faster at raw computation (highly optimized C++ with decades of work), but LiteVec trades some speed for a dramatically simpler developer experience — no server, no Docker, single file, metadata filtering built-in, and Rust memory safety. For most RAG and semantic search workloads (< 100K vectors), LiteVec's sub-millisecond search latency is more than sufficient.
+HNSW search remains sub-millisecond even at 50K vectors and outpaces brute-force at 10K+. For most RAG and semantic search workloads, this is more than sufficient. See [`examples/python/faiss_benchmark.py`](examples/python/faiss_benchmark.py) for a head-to-head comparison script against FAISS.
 
 ## 🏗️ Architecture
 

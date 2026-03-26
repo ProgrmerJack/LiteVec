@@ -125,7 +125,9 @@ impl Wal {
                 .open(&self.path)?;
             self.file = Some(file);
         }
-        Ok(self.file.as_mut().unwrap())
+        // Safety: the slice is guaranteed to be in bounds by the check at the
+        // top of this loop iteration, and the length matches the target array.
+        Ok(self.file.as_mut().expect("file was just opened above"))
     }
 
     /// Write a single record to a file.
@@ -161,11 +163,17 @@ impl Wal {
                 break; // Truncated record — stop replay here
             }
 
-            let payload_len =
-                u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+            let payload_len = u32::from_le_bytes(
+                data[offset..offset + 4]
+                    .try_into()
+                    .map_err(|_| Error::WalCorruption("truncated payload length".into()))?,
+            ) as usize;
             let record_type_byte = data[offset + 4];
-            let collection_id =
-                u16::from_le_bytes(data[offset + 5..offset + 7].try_into().unwrap());
+            let collection_id = u16::from_le_bytes(
+                data[offset + 5..offset + 7]
+                    .try_into()
+                    .map_err(|_| Error::WalCorruption("truncated collection id".into()))?,
+            );
 
             let total_record_size = WAL_RECORD_HEADER_SIZE + payload_len + WAL_CRC_SIZE;
             if offset + total_record_size > data.len() {
@@ -176,7 +184,7 @@ impl Wal {
             let stored_crc = u32::from_le_bytes(
                 data[offset + WAL_RECORD_HEADER_SIZE + payload_len..offset + total_record_size]
                     .try_into()
-                    .unwrap(),
+                    .map_err(|_| Error::WalCorruption("truncated CRC".into()))?,
             );
             let computed_crc = crc32fast::hash(record_data);
 

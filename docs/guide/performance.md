@@ -100,9 +100,14 @@ Metadata filters are evaluated before vector comparison when secondary indexes e
 **Create secondary indexes on frequently filtered fields:**
 
 ```rust
-// Coming in the API — currently internal
-// col.create_index("category");
-// col.create_index("timestamp");
+col.create_index("category");
+col.create_index("timestamp");
+
+// List indexed fields
+let fields = col.indexed_fields();
+
+// Drop an index you no longer need
+col.drop_index("timestamp");
 ```
 
 ## Benchmarks

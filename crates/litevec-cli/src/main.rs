@@ -1,5 +1,7 @@
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use litevec_core::{CollectionConfig, Database, DistanceType, Filter, IndexType};
@@ -95,6 +97,26 @@ enum Commands {
         /// Optional collection name
         #[arg(long)]
         collection: Option<String>,
+    },
+    /// Start a lightweight HTTP API server
+    Serve {
+        /// Database file path
+        db: PathBuf,
+        /// Port to listen on
+        #[arg(long, default_value = "8080")]
+        port: u16,
+    },
+    /// Run built-in benchmarks
+    Bench {
+        /// Vector dimension
+        #[arg(long, default_value = "128")]
+        dimension: u32,
+        /// Number of vectors to insert
+        #[arg(long, default_value = "10000")]
+        count: usize,
+        /// Number of search queries
+        #[arg(long, default_value = "100")]
+        queries: usize,
     },
 }
 
@@ -332,6 +354,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        Commands::Serve { db, port } => {
+            run_serve(db, port)?;
+        }
+
+        Commands::Bench {
+            dimension,
+            count,
+            queries,
+        } => {
+            run_bench(dimension, count, queries)?;
+        }
     }
 
     Ok(())
@@ -351,4 +385,300 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+// ---------------------------------------------------------------------------
+// serve — lightweight HTTP API for quick testing (not production)
+// ---------------------------------------------------------------------------
+
+fn run_serve(db_path: PathBuf, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(&db_path)?;
+    let db = std::sync::Arc::new(db);
+
+    let addr = format!("127.0.0.1:{port}");
+    let listener = TcpListener::bind(&addr)?;
+    println!("LiteVec HTTP server listening on http://{addr}");
+    println!("Database: {}", db_path.display());
+    println!("Press Ctrl+C to stop.\n");
+
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                continue;
+            }
+        };
+
+        let db = db.clone();
+        // Handle each request synchronously (lightweight server for quick testing)
+        if let Err(e) = handle_http_request(&mut stream, &db) {
+            let _ = write!(stream, "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n{{\"error\":\"{e}\"}}");
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_http_request(
+    stream: &mut std::net::TcpStream,
+    db: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+
+    // Parse request line
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
+    if parts.len() < 2 {
+        send_json(stream, 400, r#"{"error":"bad request"}"#)?;
+        return Ok(());
+    }
+    let method = parts[0];
+    let path = parts[1];
+
+    // Read headers to find Content-Length
+    let mut content_length: usize = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            break;
+        }
+        if let Some(val) = trimmed.strip_prefix("Content-Length:") {
+            content_length = val.trim().parse().unwrap_or(0);
+        }
+        if let Some(val) = trimmed.strip_prefix("content-length:") {
+            content_length = val.trim().parse().unwrap_or(0);
+        }
+    }
+
+    // Read body
+    let body = if content_length > 0 {
+        let mut buf = vec![0u8; content_length];
+        reader.read_exact(&mut buf)?;
+        String::from_utf8(buf).unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Route
+    let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
+
+    match (method, segments.as_slice()) {
+        // GET /collections — list all collections
+        ("GET", ["collections"]) => {
+            let names = db.list_collections();
+            let json = serde_json::to_string(&names)?;
+            send_json(stream, 200, &json)?;
+        }
+
+        // POST /collections/{name}?dimension=N — create collection
+        ("POST", ["collections", name]) => {
+            let params: Value = if body.is_empty() {
+                Value::Object(Default::default())
+            } else {
+                serde_json::from_str(&body)?
+            };
+            let dim = params["dimension"].as_u64().unwrap_or(128) as u32;
+            db.create_collection(name, dim)?;
+            send_json(stream, 201, &format!(r#"{{"created":"{name}","dimension":{dim}}}"#))?;
+        }
+
+        // POST /collections/{name}/insert — insert vector
+        ("POST", ["collections", name, "insert"]) => {
+            let col = db
+                .get_collection(name)
+                .ok_or(format!("collection '{name}' not found"))?;
+            let params: Value = serde_json::from_str(&body)?;
+            let id = params["id"].as_str().ok_or("missing 'id'")?;
+            let vector: Vec<f32> = params["vector"]
+                .as_array()
+                .ok_or("missing 'vector'")?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            let metadata = params.get("metadata").cloned().unwrap_or(Value::Object(Default::default()));
+            col.insert(id, &vector, metadata)?;
+            send_json(stream, 200, r#"{"ok":true}"#)?;
+        }
+
+        // POST /collections/{name}/search — search
+        ("POST", ["collections", name, "search"]) => {
+            let col = db
+                .get_collection(name)
+                .ok_or(format!("collection '{name}' not found"))?;
+            let params: Value = serde_json::from_str(&body)?;
+            let vector: Vec<f32> = params["vector"]
+                .as_array()
+                .ok_or("missing 'vector'")?
+                .iter()
+                .map(|v| v.as_f64().unwrap_or(0.0) as f32)
+                .collect();
+            let k = params["k"].as_u64().unwrap_or(10) as usize;
+            let results = col.search(&vector, k).execute()?;
+            let out: Vec<Value> = results
+                .iter()
+                .map(|r| {
+                    serde_json::json!({
+                        "id": r.id,
+                        "distance": r.distance,
+                        "metadata": r.metadata,
+                    })
+                })
+                .collect();
+            send_json(stream, 200, &serde_json::to_string(&out)?)?;
+        }
+
+        // GET /collections/{name}/{id} — get vector by ID
+        ("GET", ["collections", name, id]) if *id != "search" && *id != "insert" => {
+            let col = db
+                .get_collection(name)
+                .ok_or(format!("collection '{name}' not found"))?;
+            match col.get(id)? {
+                Some(record) => {
+                    let out = serde_json::json!({
+                        "id": record.id,
+                        "vector": record.vector,
+                        "metadata": record.metadata,
+                    });
+                    send_json(stream, 200, &serde_json::to_string(&out)?)?;
+                }
+                None => {
+                    send_json(stream, 404, r#"{"error":"not found"}"#)?;
+                }
+            }
+        }
+
+        // DELETE /collections/{name}/{id} — delete vector
+        ("DELETE", ["collections", name, id]) => {
+            let col = db
+                .get_collection(name)
+                .ok_or(format!("collection '{name}' not found"))?;
+            let deleted = col.delete(id)?;
+            send_json(stream, 200, &format!(r#"{{"deleted":{deleted}}}"#))?;
+        }
+
+        _ => {
+            send_json(stream, 404, r#"{"error":"not found"}"#)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn send_json(
+    stream: &mut std::net::TcpStream,
+    status: u16,
+    body: &str,
+) -> io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        201 => "Created",
+        400 => "Bad Request",
+        404 => "Not Found",
+        _ => "Internal Server Error",
+    };
+    write!(
+        stream,
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+// ---------------------------------------------------------------------------
+// bench — built-in benchmarks
+// ---------------------------------------------------------------------------
+
+fn run_bench(
+    dimension: u32,
+    count: usize,
+    queries: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("LiteVec Built-in Benchmark");
+    println!("==========================");
+    println!("Dimension:      {dimension}");
+    println!("Vectors:        {count}");
+    println!("Search queries: {queries}");
+    println!();
+
+    let db = Database::open_memory()?;
+
+    // --- Insert benchmark ---
+    let config = CollectionConfig {
+        dimension,
+        distance: DistanceType::Cosine,
+        index: IndexType::Hnsw,
+        ..CollectionConfig::new(dimension)
+    };
+    let col = db.create_collection_with_config("bench", config)?;
+
+    println!("Inserting {count} vectors...");
+    let start = Instant::now();
+    for i in 0..count {
+        let vector = random_vector(dimension as usize, i as u64);
+        let metadata = serde_json::json!({"i": i});
+        col.insert(&format!("v{i}"), &vector, metadata)?;
+    }
+    let insert_elapsed = start.elapsed();
+    let insert_per_sec = count as f64 / insert_elapsed.as_secs_f64();
+    println!(
+        "  Insert:  {:.2}s total, {:.0} vectors/sec",
+        insert_elapsed.as_secs_f64(),
+        insert_per_sec
+    );
+
+    // --- Search benchmark ---
+    println!("Running {queries} searches (k=10)...");
+    let start = Instant::now();
+    for i in 0..queries {
+        let query = random_vector(dimension as usize, (count + i) as u64);
+        let _results = col.search(&query, 10).execute()?;
+    }
+    let search_elapsed = start.elapsed();
+    let search_avg_us = search_elapsed.as_micros() as f64 / queries as f64;
+    let search_per_sec = queries as f64 / search_elapsed.as_secs_f64();
+    println!(
+        "  Search:  {:.2}s total, {:.1} µs/query, {:.0} queries/sec",
+        search_elapsed.as_secs_f64(),
+        search_avg_us,
+        search_per_sec
+    );
+
+    // --- Filtered search benchmark ---
+    println!("Running {queries} filtered searches (k=10, i < {})...", count / 2);
+    let start = Instant::now();
+    for i in 0..queries {
+        let query = random_vector(dimension as usize, (count * 2 + i) as u64);
+        let _results = col
+            .search(&query, 10)
+            .filter(Filter::Lt("i".to_string(), (count / 2) as f64))
+            .execute()?;
+    }
+    let filtered_elapsed = start.elapsed();
+    let filtered_avg_us = filtered_elapsed.as_micros() as f64 / queries as f64;
+    println!(
+        "  Filtered: {:.2}s total, {:.1} µs/query",
+        filtered_elapsed.as_secs_f64(),
+        filtered_avg_us
+    );
+
+    println!("\nDone.");
+    Ok(())
+}
+
+fn random_vector(dim: usize, seed: u64) -> Vec<f32> {
+    let mut v = Vec::with_capacity(dim);
+    let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+    for _ in 0..dim {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        v.push(((state >> 33) as f32) / (u32::MAX as f32) - 0.5);
+    }
+    // Normalize
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        v.iter_mut().for_each(|x| *x /= norm);
+    }
+    v
 }

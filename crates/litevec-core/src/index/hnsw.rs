@@ -160,7 +160,7 @@ impl HnswIndex {
             .filter(|(_, id)| allowed_ids.is_none_or(|allowed| allowed.contains(id)))
             .map(|(d, id)| (id, d.0))
             .collect();
-        out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        out.sort_by(|a, b| a.1.total_cmp(&b.1));
         out
     }
 
@@ -201,7 +201,7 @@ impl HnswIndex {
                 .iter()
                 .filter_map(|&n| vectors.get(n).map(|v| (n, distance_fn.compute(nv, v))))
                 .collect();
-            scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            scored.sort_by(|a, b| a.1.total_cmp(&b.1));
             *neighbors = scored
                 .into_iter()
                 .take(max_connections)

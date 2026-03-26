@@ -81,7 +81,7 @@ main();
 - **In-memory only** — No file system access in the browser. All data is stored in WASM linear memory.
 - **Single-threaded** — No `SharedArrayBuffer` / web workers support yet.
 - **Memory limit** — Bound by WASM memory limits (typically 2-4 GB).
-- **No SIMD** — WASM SIMD support is available but not yet enabled. Falls back to scalar distance computations.
+- **No SIMD** — Uses scalar distance computations. WASM SIMD can be enabled at build time for supported runtimes.
 
 ## Use Cases
 
